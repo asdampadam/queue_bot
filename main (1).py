@@ -46,7 +46,7 @@ ADMIN_IDS = {7010947964}
 _volume = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
 DB_PATH = os.getenv("DB_PATH") or (os.path.join(_volume, "queue.db") if _volume else "queue.db")
 
-DEFAULT_TOTAL = 25        # число мест по умолчанию
+DEFAULT_TOTAL = 42      # число мест по умолчанию
 DEFAULT_MAX_PER_USER = 1    # максимум мест на человека
 MAX_TOTAL_LIMIT = 80        # потолок для /setslots (лимит кнопок и длины сообщения Telegram)
 NAME_MAX = 30
