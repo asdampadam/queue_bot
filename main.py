@@ -246,7 +246,7 @@ def render(uid: int):
     lines = []
     for r in rows:
         if r["owner"] is None:
-            lines.append(f"{r['n']}. <i>свободно</i>")
+            lines.append(f"{r['n']}.")
         elif r["owner"] == uid:
             lines.append(f"{r['n']}. ⭐ <b>{esc(r['name'])}</b>")
         else:
