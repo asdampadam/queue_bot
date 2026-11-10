@@ -221,6 +221,45 @@ def delete_live(uid: int):
     last_sig.pop(uid, None)
 
 
+# ----------------- «ГОСТИ»: имена без пользователя ---------------------
+# Гость хранится в таблице users с ОТРИЦАТЕЛЬНЫМ id (у реальных людей id > 0),
+# поэтому в списке он выглядит как обычное имя. Бот ему ничего не шлёт.
+def validate_guest_name(raw: str):
+    """Для гостей подойдёт любое имя (не только «Имя Фамилия»)."""
+    name = " ".join(raw.split())
+    if not name:
+        return None, "Имя пустое."
+    if len(name) > NAME_MAX:
+        return None, f"Слишком длинно (максимум {NAME_MAX} символов)."
+    row = db.execute("SELECT id FROM users WHERE name_key=?", (name.casefold(),)).fetchone()
+    if row:
+        return None, "Такое имя уже есть в списке людей."
+    return name, None
+
+
+def add_guest_to_slot(n: int, name: str) -> str | None:
+    """Вписывает гостя на свободное место. Возвращает текст ошибки или None."""
+    if not slot_exists(n):
+        return "Такого места нет."
+    if slot_owner(n) is not None:
+        return f"Место {n} занято. Сначала освободи его."
+    name, err = validate_guest_name(name)
+    if err:
+        return err
+    with db:
+        row = db.execute("SELECT MIN(id) AS m FROM users").fetchone()
+        gid = min(-1, (row["m"] or 0) - 1)
+        db.execute("INSERT INTO users(id, name, name_key) VALUES(?, ?, ?)", (gid, name, name.casefold()))
+        db.execute("UPDATE slots SET owner=? WHERE n=?", (gid, n))
+    return None
+
+
+def cleanup_guests():
+    """Удаляет гостей, у которых не осталось мест."""
+    with db:
+        db.execute("DELETE FROM users WHERE id < 0 AND id NOT IN (SELECT owner FROM slots WHERE owner IS NOT NULL)")
+
+
 # --------------------------- ОКНО ЗАПИСИ ------------------------------
 def tz() -> timezone:
     return timezone(timedelta(hours=KZ_TZ_HOURS))
@@ -314,7 +353,7 @@ def render(uid: int):
     ).fetchall()
     mx = get_setting("max_per_user")
     mine = [r["n"] for r in rows if r["owner"] == uid]
-    others = [r["n"] for r in rows if r["owner"] is not None and r["owner"] != uid]
+    others = [r["n"] for r in rows if r["owner"] is not None and r["owner"] > 0 and r["owner"] != uid]
     free = [r["n"] for r in rows if r["owner"] is None]
 
     st = views.get(uid) or {"mode": "main"}
@@ -426,6 +465,7 @@ async def refresher(bot: Bot):
         await asyncio.sleep(0.25)  # склеиваем быстрые изменения в одно обновление
         dirty.clear()
         try:
+            cleanup_guests()
             for r in db.execute("SELECT user_id FROM live").fetchall():
                 await push_view(bot, r["user_id"])
                 await asyncio.sleep(0.04)
@@ -457,7 +497,7 @@ async def propose(bot: Bot, uid: int, give: int, target: int):
     if slot_owner(give) != uid:
         return "Это место уже не твоё.", True
     to_user = slot_owner(target)
-    if to_user is None or to_user == uid:
+    if to_user is None or to_user == uid or to_user < 0:
         return "С этим местом обменяться нельзя (оно свободно или твоё).", True
     dup = db.execute(
         "SELECT 1 FROM offers WHERE status='pending' AND from_user=? AND from_slot=? AND to_slot=?",
@@ -620,6 +660,32 @@ async def sec_put(m: Message, command: CommandObject):
         db.execute("UPDATE slots SET owner=? WHERE n=?", (user["id"], n))
     dirty.set()
     await m.answer(f"✅ Место {n} → {user['name']}")
+
+
+@router.message(Command("add"))
+async def sec_add(m: Message, command: CommandObject):
+    """/add [место] <имя> — вписать в очередь просто имя (без пользователя)."""
+    if not is_admin(m):
+        return
+    args = (command.args or "").strip()
+    if not args:
+        await m.answer("Формат: /add <место> <имя> или /add <имя> (на первое свободное место)")
+        return
+    first, _, rest = args.partition(" ")
+    if first.isdigit() and rest.strip():
+        n, name = int(first), rest
+    else:
+        row = db.execute("SELECT n FROM slots WHERE owner IS NULL ORDER BY n LIMIT 1").fetchone()
+        if not row:
+            await m.answer("Свободных мест нет.")
+            return
+        n, name = row["n"], args
+    err = add_guest_to_slot(n, name)
+    if err:
+        await m.answer("⚠️ " + err)
+        return
+    dirty.set()
+    await m.answer(f"✅ Место {n} → {esc(' '.join(name.split()))}")
 
 
 @router.message(Command("free"))
@@ -799,6 +865,7 @@ async def adm_window(m: Message, command: CommandObject):
 # ----------------------------- АДМИН-ПАНЕЛЬ ---------------------------
 wiz: dict[int, dict] = {}        # админ -> состояние мастера выбора времени
 adm_rename: dict[int, int] = {}  # админ -> id человека, которого переименовываем
+adm_guest: dict[int, int] = {}   # админ -> место, на которое вписывает имя
 WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 PAGE = 8
 
@@ -970,6 +1037,8 @@ def panel_slot(n: int):
     rows = []
     if owner is not None:
         rows.append([btn("🗑 Освободить", f"a:f:{n}")])
+    if owner is None:
+        rows.append([btn("✍️ Вписать имя", f"a:gn:{n}")])
     rows.append([btn("👤 Поставить человека", f"a:pp:{n}:0")])
     rows.append([btn("🔀 Поменять с другим местом", f"a:sw:{n}")])
     rows.append([btn("◀️ К местам", "a:s")])
@@ -1040,6 +1109,8 @@ def admin_commands_text() -> str:
         "📖 <b>Команды админа</b> (всё то же самое есть в кнопках панели)\n\n"
         "/admin — открыть панель\n"
         "/put &lt;место&gt; &lt;имя&gt; — поставить человека на место\n"
+        "/add &lt;место&gt; &lt;любое имя&gt; — вписать просто имя (без пользователя)\n"
+        "/add &lt;любое имя&gt; — то же, на первое свободное место\n"
         "/free &lt;место&gt; — освободить место\n"
         "/swap &lt;м1&gt; &lt;м2&gt; — поменять два места\n"
         "/rename Старое | Новое — переименовать человека\n"
@@ -1078,6 +1149,8 @@ async def on_admin_cb(cb: CallbackQuery, bot: Bot):
 
     if act != "ur":
         adm_rename.pop(uid, None)
+    if act != "gn":
+        adm_guest.pop(uid, None)
     if act not in ("d", "h", "m", "wd", "wo"):
         wiz.pop(uid, None)
 
@@ -1176,6 +1249,16 @@ async def on_admin_cb(cb: CallbackQuery, bot: Bot):
         dirty.set()
         note = f"Место {a0} освобождено"
         view = panel_slot(a0)
+
+    elif act == "gn" and a0 is not None:
+        if not slot_exists(a0) or slot_owner(a0) is not None:
+            note, alert, view = "Место занято или не существует.", True, panel_slots()
+        else:
+            adm_guest[uid] = a0
+            view = (
+                f"✍️ Напиши любое имя для места <b>{a0}</b> следующим сообщением.",
+                mk([[btn("✖️ Отмена", f"a:sl:{a0}")]]),
+            )
 
     elif act == "pp" and a0 is not None and a1 is not None:
         view = people_picker(a1, f"a:pu:{a0}", f"a:pp:{a0}", f"a:sl:{a0}", f"👤 <b>Кого поставить на место {a0}?</b>")
@@ -1279,6 +1362,17 @@ async def on_admin_cb(cb: CallbackQuery, bot: Bot):
 @router.message(F.text, ~F.text.startswith("/"))
 async def on_text(m: Message, bot: Bot):
     uid = m.from_user.id
+    if uid in adm_guest and uid in ADMIN_IDS:
+        n = adm_guest[uid]
+        err = add_guest_to_slot(n, m.text)
+        if err:
+            await m.answer("⚠️ " + err + "\nПопробуй другое имя или нажми «Отмена».")
+            return
+        adm_guest.pop(uid, None)
+        dirty.set()
+        text, markup = panel_slot(n)
+        await m.answer("✅ Имя вписано.\n\n" + text, reply_markup=markup)
+        return
     if uid in adm_rename and uid in ADMIN_IDS:
         target = adm_rename.pop(uid)
         name, err = validate_name(m.text, target)
@@ -1388,7 +1482,7 @@ async def on_cb(cb: CallbackQuery, bot: Bot):
     elif action == "trd":
         mine = own_slots(uid)
         others = db.execute(
-            "SELECT 1 FROM slots WHERE owner IS NOT NULL AND owner != ? LIMIT 1", (uid,)
+            "SELECT 1 FROM slots WHERE owner > 0 AND owner != ? LIMIT 1", (uid,)
         ).fetchone()
         if not mine:
             note, alert = "Сначала займи место — потом можно меняться.", True
