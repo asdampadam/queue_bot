@@ -89,6 +89,7 @@ def init_db():
             chat_id INTEGER NOT NULL,
             message_id INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS gap_zones(from_n INTEGER PRIMARY KEY, gap INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS offers(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             from_user INTEGER NOT NULL,
@@ -105,6 +106,11 @@ def init_db():
     db.execute("INSERT OR IGNORE INTO settings VALUES('win_mode', 0)")
     db.execute("INSERT OR IGNORE INTO settings VALUES('win_start', 0)")
     db.execute("INSERT OR IGNORE INTO settings VALUES('win_end', 0)")
+    # автоочистка: ac_on 0/1, ac_time = минуты от полуночи (по Казахстану), ac_last = дата последней очистки (ordinal)
+    db.execute("INSERT OR IGNORE INTO gap_zones VALUES(1, 0)")
+    db.execute("INSERT OR IGNORE INTO settings VALUES('ac_on', 0)")
+    db.execute("INSERT OR IGNORE INTO settings VALUES('ac_time', 0)")
+    db.execute("INSERT OR IGNORE INTO settings VALUES('ac_last', 0)")
     db.commit()
     resize_slots(get_setting("total"))
 
@@ -137,6 +143,21 @@ def set_name(uid: int, name: str):
             "ON CONFLICT(id) DO UPDATE SET name=excluded.name, name_key=excluded.name_key",
             (uid, name, name.casefold()),
         )
+
+
+def add_guest(name: str) -> int:
+    """Добавляет человека вручную (не пользователя бота). Его id отрицательный."""
+    row = db.execute("SELECT MIN(id) AS m FROM users").fetchone()
+    gid = min(-1, (row["m"] or 0) - 1)
+    with db:
+        db.execute("INSERT INTO users(id, name, name_key) VALUES(?, ?, ?)", (gid, name, name.casefold()))
+    return gid
+
+
+def delete_guest(gid: int):
+    with db:
+        db.execute("UPDATE slots SET owner=NULL WHERE owner=?", (gid,))
+        db.execute("DELETE FROM users WHERE id=? AND id < 0", (gid,))
 
 
 def validate_name(raw: str, uid: int | None = None):
@@ -178,9 +199,59 @@ def own_slots(uid: int) -> list[int]:
     return [r["n"] for r in db.execute("SELECT n FROM slots WHERE owner=? ORDER BY n", (uid,))]
 
 
+MAX_GAP = 20
+
+
+def gap_zones() -> list:
+    return db.execute("SELECT from_n, gap FROM gap_zones ORDER BY from_n").fetchall()
+
+
+def gap_for(n: int) -> int:
+    """Нужный интервал для места n (зона определяется по месту, которое берут)."""
+    row = db.execute("SELECT gap FROM gap_zones WHERE from_n<=? ORDER BY from_n DESC LIMIT 1", (n,)).fetchone()
+    return row["gap"] if row else 0
+
+
+def gap_conflict(uid: int, n: int, ignore=()):
+    """Возвращает номер своего места, слишком близкого к n, либо None.
+    Интервал g = минимум мест МЕЖДУ двумя местами одного человека (0 — без ограничений)."""
+    g = gap_for(n)
+    if g <= 0:
+        return None
+    for s_ in own_slots(uid):
+        if s_ != n and s_ not in ignore and abs(s_ - n) <= g:
+            return s_
+    return None
+
+
+def set_gap_zones(zones: dict):
+    """zones: {начало_зоны: интервал}. Зона с места 1 есть всегда."""
+    zones = dict(zones)
+    zones.setdefault(1, 0)
+    with db:
+        db.execute("DELETE FROM gap_zones")
+        for k, v in zones.items():
+            db.execute("INSERT INTO gap_zones(from_n, gap) VALUES(?, ?)", (k, v))
+
+
+def describe_gaps() -> str:
+    z = gap_zones()
+    total = get_setting("total")
+    if len(z) == 1:
+        g = z[0]["gap"]
+        return "везде: " + (f"{g} мест между своими местами" if g else "без ограничений")
+    parts = []
+    for i, r in enumerate(z):
+        end = z[i + 1]["from_n"] - 1 if i + 1 < len(z) else total
+        parts.append(f"{r['from_n']}–{end}: " + (str(r["gap"]) if r["gap"] else "нет"))
+    return ", ".join(parts)
+
+
 def take_slot(uid: int, n: int) -> str:
     if len(own_slots(uid)) >= get_setting("max_per_user"):
         return "limit"
+    if gap_conflict(uid, n) is not None:
+        return "gap"
     with db:
         cur = db.execute("UPDATE slots SET owner=? WHERE n=? AND owner IS NULL", (uid, n))
     if cur.rowcount == 1:
@@ -219,45 +290,6 @@ def delete_live(uid: int):
     with db:
         db.execute("DELETE FROM live WHERE user_id=?", (uid,))
     last_sig.pop(uid, None)
-
-
-# ----------------- «ГОСТИ»: имена без пользователя ---------------------
-# Гость хранится в таблице users с ОТРИЦАТЕЛЬНЫМ id (у реальных людей id > 0),
-# поэтому в списке он выглядит как обычное имя. Бот ему ничего не шлёт.
-def validate_guest_name(raw: str):
-    """Для гостей подойдёт любое имя (не только «Имя Фамилия»)."""
-    name = " ".join(raw.split())
-    if not name:
-        return None, "Имя пустое."
-    if len(name) > NAME_MAX:
-        return None, f"Слишком длинно (максимум {NAME_MAX} символов)."
-    row = db.execute("SELECT id FROM users WHERE name_key=?", (name.casefold(),)).fetchone()
-    if row:
-        return None, "Такое имя уже есть в списке людей."
-    return name, None
-
-
-def add_guest_to_slot(n: int, name: str) -> str | None:
-    """Вписывает гостя на свободное место. Возвращает текст ошибки или None."""
-    if not slot_exists(n):
-        return "Такого места нет."
-    if slot_owner(n) is not None:
-        return f"Место {n} занято. Сначала освободи его."
-    name, err = validate_guest_name(name)
-    if err:
-        return err
-    with db:
-        row = db.execute("SELECT MIN(id) AS m FROM users").fetchone()
-        gid = min(-1, (row["m"] or 0) - 1)
-        db.execute("INSERT INTO users(id, name, name_key) VALUES(?, ?, ?)", (gid, name, name.casefold()))
-        db.execute("UPDATE slots SET owner=? WHERE n=?", (gid, n))
-    return None
-
-
-def cleanup_guests():
-    """Удаляет гостей, у которых не осталось мест."""
-    with db:
-        db.execute("DELETE FROM users WHERE id < 0 AND id NOT IN (SELECT owner FROM slots WHERE owner IS NOT NULL)")
 
 
 # --------------------------- ОКНО ЗАПИСИ ------------------------------
@@ -353,7 +385,7 @@ def render(uid: int):
     ).fetchall()
     mx = get_setting("max_per_user")
     mine = [r["n"] for r in rows if r["owner"] == uid]
-    others = [r["n"] for r in rows if r["owner"] is not None and r["owner"] > 0 and r["owner"] != uid]
+    others = [r["n"] for r in rows if r["owner"] is not None and r["owner"] != uid]
     free = [r["n"] for r in rows if r["owner"] is None]
 
     st = views.get(uid) or {"mode": "main"}
@@ -388,8 +420,16 @@ def render(uid: int):
 
     back = [B(text="◀️ Назад", callback_data="m")]
     if mode == "take":
-        text += "\n\n➕ <b>Выбери свободное место:</b>" if free else "\n\nСвободных мест нет."
-        kb = grid([B(text=str(n), callback_data=f"t:{n}") for n in free]) + [back]
+        allowed = [n for n in free if gap_conflict(uid, n) is None]
+        if not free:
+            text += "\n\nСвободных мест нет."
+        elif not allowed:
+            text += "\n\nСвободные места слишком близко к твоим (действует интервал между местами)."
+        else:
+            text += "\n\n➕ <b>Выбери свободное место:</b>"
+            if len(allowed) < len(free):
+                text += f"\n(скрыто мест из-за интервала: {len(free) - len(allowed)})"
+        kb = grid([B(text=str(n), callback_data=f"t:{n}") for n in allowed]) + [back]
     elif mode == "release":
         text += "\n\n➖ <b>Какое место освободить?</b>"
         kb = grid([B(text=f"Место {n}", callback_data=f"r:{n}") for n in mine], 2) + [back]
@@ -465,12 +505,53 @@ async def refresher(bot: Bot):
         await asyncio.sleep(0.25)  # склеиваем быстрые изменения в одно обновление
         dirty.clear()
         try:
-            cleanup_guests()
             for r in db.execute("SELECT user_id FROM live").fetchall():
                 await push_view(bot, r["user_id"])
                 await asyncio.sleep(0.04)
         except Exception:
             logging.exception("refresher error")
+
+
+def clear_queue():
+    with db:
+        db.execute("UPDATE slots SET owner=NULL")
+        db.execute("UPDATE offers SET status='void' WHERE status='pending'")
+
+
+def describe_autoclear() -> str:
+    if not get_setting("ac_on"):
+        return "выключена"
+    return f"каждый день в {fmt_hm(get_setting('ac_time'))}"
+
+
+def set_autoclear(minutes: int | None):
+    """minutes=None — выключить. Если время сегодня уже прошло, первая очистка будет завтра."""
+    if minutes is None:
+        set_setting("ac_on", 0)
+        return
+    now = datetime.now(tz())
+    set_setting("ac_time", minutes)
+    set_setting("ac_on", 1)
+    already = now.hour * 60 + now.minute >= minutes
+    set_setting("ac_last", now.date().toordinal() if already else 0)
+
+
+async def autoclear_watcher():
+    """Раз в 15 секунд проверяет: не пора ли очистить очередь."""
+    while True:
+        await asyncio.sleep(15)
+        try:
+            if not get_setting("ac_on"):
+                continue
+            now = datetime.now(tz())
+            today = now.date().toordinal()
+            if now.hour * 60 + now.minute >= get_setting("ac_time") and get_setting("ac_last") != today:
+                set_setting("ac_last", today)
+                clear_queue()
+                dirty.set()
+                logging.info("Автоочистка очереди выполнена")
+        except Exception:
+            logging.exception("autoclear error")
 
 
 async def window_watcher():
@@ -497,8 +578,15 @@ async def propose(bot: Bot, uid: int, give: int, target: int):
     if slot_owner(give) != uid:
         return "Это место уже не твоё.", True
     to_user = slot_owner(target)
-    if to_user is None or to_user == uid or to_user < 0:
+    if to_user is None or to_user == uid:
         return "С этим местом обменяться нельзя (оно свободно или твоё).", True
+    if to_user < 0:
+        return "Это место добавлено админом вручную — обмен с ним невозможен.", True
+    c = gap_conflict(uid, target, ignore={give})
+    if c is not None:
+        return f"Нельзя: место {target} слишком близко к твоему месту {c} (нужно минимум {gap_for(target)} мест между ними).", True
+    if gap_conflict(to_user, give, ignore={target}) is not None:
+        return "Обмен невозможен: у владельца этого места получились бы слишком близкие места.", True
     dup = db.execute(
         "SELECT 1 FROM offers WHERE status='pending' AND from_user=? AND from_slot=? AND to_slot=?",
         (uid, give, target),
@@ -573,6 +661,14 @@ async def on_offer_reply(cb: CallbackQuery, bot: Bot):
         await cb.answer("Места уже изменились — обмен невозможен.", show_alert=True)
         if cb.message:
             await safe_edit(cb.message, "⚠️ Предложение устарело: места уже изменились.")
+        return
+
+    if gap_conflict(fu, ts, ignore={fs}) is not None or gap_conflict(tu, fs, ignore={ts}) is not None:
+        with db:
+            db.execute("UPDATE offers SET status='void' WHERE id=?", (oid,))
+        await cb.answer("Обмен нарушает интервал между местами.", show_alert=True)
+        if cb.message:
+            await safe_edit(cb.message, "⚠️ Обмен невозможен: нарушается интервал между местами.")
         return
 
     swap_owners(fs, ts)
@@ -662,32 +758,6 @@ async def sec_put(m: Message, command: CommandObject):
     await m.answer(f"✅ Место {n} → {user['name']}")
 
 
-@router.message(Command("add"))
-async def sec_add(m: Message, command: CommandObject):
-    """/add [место] <имя> — вписать в очередь просто имя (без пользователя)."""
-    if not is_admin(m):
-        return
-    args = (command.args or "").strip()
-    if not args:
-        await m.answer("Формат: /add <место> <имя> или /add <имя> (на первое свободное место)")
-        return
-    first, _, rest = args.partition(" ")
-    if first.isdigit() and rest.strip():
-        n, name = int(first), rest
-    else:
-        row = db.execute("SELECT n FROM slots WHERE owner IS NULL ORDER BY n LIMIT 1").fetchone()
-        if not row:
-            await m.answer("Свободных мест нет.")
-            return
-        n, name = row["n"], args
-    err = add_guest_to_slot(n, name)
-    if err:
-        await m.answer("⚠️ " + err)
-        return
-    dirty.set()
-    await m.answer(f"✅ Место {n} → {esc(' '.join(name.split()))}")
-
-
 @router.message(Command("free"))
 async def sec_free(m: Message, command: CommandObject):
     """/free <место> — освободить место."""
@@ -743,6 +813,98 @@ async def sec_rename(m: Message, command: CommandObject):
     await m.answer(f"✅ {user['name']} → {name}")
 
 
+@router.message(Command("add"))
+async def sec_add(m: Message, command: CommandObject):
+    """/add <имя фамилия> [место] — добавить человека вручную (не обязательно из бота)."""
+    if not is_admin(m):
+        return
+    args = (command.args or "").split()
+    slot = None
+    if len(args) >= 2 and args[-1].isdigit():
+        slot = int(args.pop())
+    if not args:
+        await m.answer("Формат: /add Имя Фамилия [место]\nНапример: /add Иван Петров 12")
+        return
+    if slot is not None and not slot_exists(slot):
+        await m.answer("Такого места нет.")
+        return
+    name, err = validate_name(" ".join(args))
+    if err:
+        await m.answer("⚠️ " + err)
+        return
+    gid = add_guest(name)
+    if slot is not None:
+        with db:
+            db.execute("UPDATE slots SET owner=? WHERE n=?", (gid, slot))
+        dirty.set()
+        await m.answer(f"✅ {name} добавлен(а) и поставлен(а) на место {slot}.")
+    else:
+        await m.answer(f"✅ {name} добавлен(а) в список людей. Поставить на место: /put <место> {name}")
+
+
+@router.message(Command("gap"))
+async def sec_gap(m: Message, command: CommandObject):
+    """/gap 5 — для всех мест; /gap 1:5 21:1 — зоны (с какого места : интервал)."""
+    if not is_admin(m):
+        return
+    args = (command.args or "").split()
+    if not args:
+        await m.answer(
+            f"↔️ Интервал между местами одного человека: {describe_gaps()}\n\n"
+            "Интервал = сколько мест должно быть МЕЖДУ двумя местами одного человека (0 — без ограничений).\n"
+            "<code>/gap 5</code> — везде 5\n"
+            "<code>/gap 1:5 21:1</code> — с места 1 интервал 5, с места 21 интервал 1\n"
+            "<code>/gap 0</code> — без ограничений\n"
+            "Или кнопками: /admin → «Интервалы»."
+        )
+        return
+    total = get_setting("total")
+    zones = {}
+    try:
+        if len(args) == 1 and ":" not in args[0]:
+            zones = {1: int(args[0])}
+        else:
+            for a in args:
+                f, g = a.split(":")
+                zones[int(f)] = int(g)
+    except ValueError:
+        await m.answer("Формат: /gap 5 или /gap 1:5 21:1")
+        return
+    if not zones or any(not (1 <= f <= total) or not (0 <= g <= MAX_GAP) for f, g in zones.items()):
+        await m.answer(f"Начало зоны — от 1 до {total}, интервал — от 0 до {MAX_GAP}.")
+        return
+    set_gap_zones(zones)
+    dirty.set()
+    await m.answer(f"✅ Интервалы: {describe_gaps()}")
+
+
+@router.message(Command("autoclear"))
+async def sec_autoclear(m: Message, command: CommandObject):
+    """/autoclear 06:00 — каждый день очищать очередь в это время; /autoclear off — выключить."""
+    if not is_admin(m):
+        return
+    arg = (command.args or "").strip().lower()
+    if not arg:
+        await m.answer(
+            f"🧹 Автоочистка: {describe_autoclear()}\n"
+            f"Время по: {tz_label()}, сейчас {now_local_str()}\n\n"
+            "<code>/autoclear 06:00</code> — каждый день в 06:00\n"
+            "<code>/autoclear off</code> — выключить\n"
+            "Или кнопками: /admin → «Автоочистка»."
+        )
+        return
+    if arg in ("off", "выкл"):
+        set_autoclear(None)
+        await m.answer("✅ Автоочистка выключена.")
+        return
+    t = parse_hm(arg)
+    if t is None:
+        await m.answer("Формат: /autoclear 06:00 или /autoclear off")
+        return
+    set_autoclear(t)
+    await m.answer(f"✅ Очередь будет очищаться каждый день в {fmt_hm(t)} ({tz_label()}).")
+
+
 # ------------------------- АДМИН-КОМАНДЫ ------------------------------
 def is_admin(m: Message) -> bool:
     return bool(m.from_user and m.from_user.id in ADMIN_IDS)
@@ -763,9 +925,7 @@ async def adm_clear(m: Message, command: CommandObject):
     if (command.args or "").strip().lower() != "yes":
         await m.answer("Это уберёт всех из очереди. Подтверди командой: /clear yes")
         return
-    with db:
-        db.execute("UPDATE slots SET owner=NULL")
-        db.execute("UPDATE offers SET status='void' WHERE status='pending'")
+    clear_queue()
     dirty.set()
     await m.answer("✅ Очередь очищена.")
 
@@ -865,7 +1025,7 @@ async def adm_window(m: Message, command: CommandObject):
 # ----------------------------- АДМИН-ПАНЕЛЬ ---------------------------
 wiz: dict[int, dict] = {}        # админ -> состояние мастера выбора времени
 adm_rename: dict[int, int] = {}  # админ -> id человека, которого переименовываем
-adm_guest: dict[int, int] = {}   # админ -> место, на которое вписывает имя
+adm_add: dict[int, int] = {}     # админ -> номер места (0 = без места), пока вводит имя нового человека
 WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 PAGE = 8
 
@@ -907,12 +1067,15 @@ def panel_main():
         f"Максимум на человека: {mx}\n"
         f"Людей в боте: {users}\n\n"
         f"🕒 Запись: {describe_window()}\n{status}\n"
+        f"⏰ Автоочистка: {describe_autoclear()}\n"
+        f"↔️ Интервал между местами: {describe_gaps()}\n"
         f"Сейчас {now_local_str()} · {tz_label()}"
     )
     rows = [
         [btn("🕒 Время записи", "a:t"), btn("🧩 Места", "a:s")],
         [btn("👥 Люди", "a:u:0"), btn("⚙️ Настройки", "a:g")],
-        [btn("🧹 Очистить очередь", "a:c")],
+        [btn("➕ Добавить человека", "a:an:0"), btn("↔️ Интервалы", "a:gp")],
+        [btn("🧹 Очистить очередь", "a:c"), btn("⏰ Автоочистка", "a:ac")],
         [btn("📖 Команды", "a:help"), btn("✖️ Закрыть", "a:x")],
     ]
     return text, mk(rows)
@@ -1013,6 +1176,54 @@ def wiz_finish(uid: int):
     return None
 
 
+def panel_autoclear(step: str = "", hour: int | None = None):
+    head = (
+        "⏰ <b>Автоочистка очереди</b>\n\n"
+        f"Сейчас: {describe_autoclear()}\n"
+        f"Время по: {tz_label()}, сейчас {now_local_str()}\n\n"
+    )
+    if step == "h":
+        rows = grid([btn(f"{h:02d}", f"a:ach:{h}") for h in range(24)], 6)
+        rows.append([btn("✖️ Отмена", "a:ac")])
+        return head + "Выбери <b>час</b>, когда очищать очередь каждый день:", mk(rows)
+    if step == "m" and hour is not None:
+        rows = grid([btn(f"{hour:02d}:{mi:02d}", f"a:acm:{hour}:{mi}") for mi in range(0, 60, 5)], 4)
+        rows.append([btn("✖️ Отмена", "a:ac")])
+        return head + f"Час: {hour:02d}. Выбери <b>минуты</b>:", mk(rows)
+    rows = [[btn("✏️ Задать время", "a:acs")]]
+    if get_setting("ac_on"):
+        rows.append([btn("⏹ Выключить", "a:aco")])
+    rows.append([btn("◀️ Назад", "a:home")])
+    return head + "В заданное время все люди автоматически снимаются с мест (имена остаются).", mk(rows)
+
+
+def gap_picker(prefix: str, title: str, back: str):
+    rows = grid([btn(str(g), f"{prefix}:{g}") for g in range(0, 11)], 6)
+    rows.append([btn("◀️ Назад", back)])
+    return title, mk(rows)
+
+
+def panel_gaps():
+    z = gap_zones()
+    text = (
+        "↔️ <b>Интервал между местами</b>\n\n"
+        f"Сейчас: {describe_gaps()}\n\n"
+        "Интервал — сколько мест должно быть <b>между</b> двумя местами одного человека "
+        "(0 — без ограничений). Например, при интервале 5 после места 5 следующее можно взять с места 11.\n"
+        "Зона определяется по тому месту, которое человек берёт. "
+        "Админская команда /put интервал не проверяет."
+    )
+    rows = [
+        [btn("🔢 Один интервал для всех мест", "a:gu")],
+        [btn("➕ Добавить зону (с места…)", "a:gz")],
+    ]
+    for r in z:
+        if r["from_n"] > 1:
+            rows.append([btn(f"🗑 Убрать зону с места {r['from_n']}", f"a:gd:{r['from_n']}")])
+    rows.append([btn("◀️ Назад", "a:home")])
+    return text, mk(rows)
+
+
 def panel_slots():
     buttons = []
     for r in db.execute("SELECT n, owner FROM slots ORDER BY n"):
@@ -1037,9 +1248,8 @@ def panel_slot(n: int):
     rows = []
     if owner is not None:
         rows.append([btn("🗑 Освободить", f"a:f:{n}")])
-    if owner is None:
-        rows.append([btn("✍️ Вписать имя", f"a:gn:{n}")])
     rows.append([btn("👤 Поставить человека", f"a:pp:{n}:0")])
+    rows.append([btn("➕ Добавить нового и поставить", f"a:an:{n}")])
     rows.append([btn("🔀 Поменять с другим местом", f"a:sw:{n}")])
     rows.append([btn("◀️ К местам", "a:s")])
     return text, mk(rows)
@@ -1077,13 +1287,17 @@ def panel_person(uid2: int):
     if not u:
         return people_picker(0, "a:up", "a:u", "a:home", "👥 <b>Люди</b>\nВыбери человека:")
     sl = own_slots(uid2)
+    guest = uid2 < 0
     text = (
-        f"👤 <b>{esc(u['name'])}</b>\nID: {uid2}\n"
-        "Места: " + (", ".join(map(str, sl)) if sl else "нет")
+        f"👤 <b>{esc(u['name'])}</b>\n"
+        + ("Добавлен вручную (не из бота)\n" if guest else f"ID: {uid2}\n")
+        + "Места: " + (", ".join(map(str, sl)) if sl else "нет")
     )
     rows = [[btn("✏️ Переименовать", f"a:ur:{uid2}")]]
     if sl:
         rows.append([btn("🗑 Снять со всех мест", f"a:uf:{uid2}")])
+    if guest:
+        rows.append([btn("❌ Удалить из списка людей", f"a:ud:{uid2}")])
     rows.append([btn("◀️ К людям", "a:u:0")])
     return text, mk(rows)
 
@@ -1109,15 +1323,17 @@ def admin_commands_text() -> str:
         "📖 <b>Команды админа</b> (всё то же самое есть в кнопках панели)\n\n"
         "/admin — открыть панель\n"
         "/put &lt;место&gt; &lt;имя&gt; — поставить человека на место\n"
-        "/add &lt;место&gt; &lt;любое имя&gt; — вписать просто имя (без пользователя)\n"
-        "/add &lt;любое имя&gt; — то же, на первое свободное место\n"
+        "/add Имя Фамилия [место] — добавить человека вручную (можно не из бота)\n"
         "/free &lt;место&gt; — освободить место\n"
         "/swap &lt;м1&gt; &lt;м2&gt; — поменять два места\n"
         "/rename Старое | Новое — переименовать человека\n"
         "/window 18:00 20:00 — запись каждый день в это время\n"
         "/window 15.11 18:00 15.11 20:00 — один раз\n"
         "/window off — без ограничений\n"
+        "/gap 1:5 21:1 — интервал между местами по зонам (/gap 5 — для всех)\n"
         "/clear yes — очистить очередь\n"
+        "/autoclear 06:00 — очищать очередь каждый день в это время\n"
+        "/autoclear off — выключить автоочистку\n"
         "/setslots N — число мест\n"
         "/setmax N — максимум мест на человека\n"
         "/users — список людей\n\n"
@@ -1149,8 +1365,8 @@ async def on_admin_cb(cb: CallbackQuery, bot: Bot):
 
     if act != "ur":
         adm_rename.pop(uid, None)
-    if act != "gn":
-        adm_guest.pop(uid, None)
+    if act != "an":
+        adm_add.pop(uid, None)
     if act not in ("d", "h", "m", "wd", "wo"):
         wiz.pop(uid, None)
 
@@ -1250,16 +1466,6 @@ async def on_admin_cb(cb: CallbackQuery, bot: Bot):
         note = f"Место {a0} освобождено"
         view = panel_slot(a0)
 
-    elif act == "gn" and a0 is not None:
-        if not slot_exists(a0) or slot_owner(a0) is not None:
-            note, alert, view = "Место занято или не существует.", True, panel_slots()
-        else:
-            adm_guest[uid] = a0
-            view = (
-                f"✍️ Напиши любое имя для места <b>{a0}</b> следующим сообщением.",
-                mk([[btn("✖️ Отмена", f"a:sl:{a0}")]]),
-            )
-
     elif act == "pp" and a0 is not None and a1 is not None:
         view = people_picker(a1, f"a:pu:{a0}", f"a:pp:{a0}", f"a:sl:{a0}", f"👤 <b>Кого поставить на место {a0}?</b>")
 
@@ -1306,6 +1512,25 @@ async def on_admin_cb(cb: CallbackQuery, bot: Bot):
                 mk([[btn("✖️ Отмена", f"a:up:{a0}")]]),
             )
 
+    elif act == "an" and a0 is not None:
+        if a0 and not slot_exists(a0):
+            note, alert, view = "Такого места нет.", True, panel_slots()
+        else:
+            adm_add[uid] = a0
+            where = f" и поставлю на место {a0}" if a0 else ""
+            view = (
+                f"➕ Напиши имя и фамилию нового человека следующим сообщением — добавлю в список{where}.\n"
+                "Он может не пользоваться ботом.",
+                mk([[btn("✖️ Отмена", f"a:sl:{a0}" if a0 else "a:home")]]),
+            )
+
+    elif act == "ud" and a0 is not None and a0 < 0:
+        u = get_user(a0)
+        delete_guest(a0)
+        dirty.set()
+        note = f"Удалён: {u['name']}" if u else "Уже удалён"
+        view = people_picker(0, "a:up", "a:u", "a:home", "👥 <b>Люди</b>\nВыбери человека:")
+
     elif act == "uf" and a0 is not None:
         with db:
             db.execute("UPDATE slots SET owner=NULL WHERE owner=?", (a0,))
@@ -1337,6 +1562,64 @@ async def on_admin_cb(cb: CallbackQuery, bot: Bot):
         dirty.set()
         view = panel_settings()
 
+    # ----- интервалы между местами -----
+    elif act == "gp":
+        view = panel_gaps()
+
+    elif act == "gu":
+        view = gap_picker("a:ga", "🔢 <b>Интервал для всех мест.</b>\nСколько мест между своими местами?", "a:gp")
+
+    elif act == "ga" and a0 is not None and 0 <= a0 <= MAX_GAP:
+        set_gap_zones({1: a0})
+        dirty.set()
+        note = "✅ Интервал для всех мест сохранён"
+        view = panel_gaps()
+
+    elif act == "gz":
+        total = get_setting("total")
+        rows = grid([btn(str(n), f"a:gs:{n}") for n in range(1, total + 1)])
+        rows.append([btn("◀️ Назад", "a:gp")])
+        view = ("➕ <b>Новая зона.</b> С какого места она начинается?\n"
+                "(Действует до начала следующей зоны.)", mk(rows))
+
+    elif act == "gs" and a0 is not None and slot_exists(a0):
+        view = gap_picker(f"a:gg:{a0}", f"С места <b>{a0}</b>. Сколько мест между своими местами?", "a:gz")
+
+    elif act == "gg" and a0 is not None and a1 is not None and slot_exists(a0) and 0 <= a1 <= MAX_GAP:
+        zones = {r["from_n"]: r["gap"] for r in gap_zones()}
+        zones[a0] = a1
+        set_gap_zones(zones)
+        dirty.set()
+        note = f"✅ С места {a0}: интервал {a1}"
+        view = panel_gaps()
+
+    elif act == "gd" and a0 is not None and a0 > 1:
+        zones = {r["from_n"]: r["gap"] for r in gap_zones() if r["from_n"] != a0}
+        set_gap_zones(zones)
+        dirty.set()
+        note = "Зона убрана"
+        view = panel_gaps()
+
+    # ----- автоочистка -----
+    elif act == "ac":
+        view = panel_autoclear()
+
+    elif act == "acs":
+        view = panel_autoclear("h")
+
+    elif act == "ach" and a0 is not None and 0 <= a0 <= 23:
+        view = panel_autoclear("m", a0)
+
+    elif act == "acm" and a0 is not None and a1 is not None and 0 <= a0 <= 23 and 0 <= a1 <= 59:
+        set_autoclear(a0 * 60 + a1)
+        note = f"✅ Очистка каждый день в {a0:02d}:{a1:02d}"
+        view = panel_autoclear()
+
+    elif act == "aco":
+        set_autoclear(None)
+        note = "Автоочистка выключена"
+        view = panel_autoclear()
+
     # ----- очистка -----
     elif act == "c":
         view = (
@@ -1345,9 +1628,7 @@ async def on_admin_cb(cb: CallbackQuery, bot: Bot):
         )
 
     elif act == "cy":
-        with db:
-            db.execute("UPDATE slots SET owner=NULL")
-            db.execute("UPDATE offers SET status='void' WHERE status='pending'")
+        clear_queue()
         dirty.set()
         note = "✅ Очередь очищена"
         view = panel_main()
@@ -1362,16 +1643,23 @@ async def on_admin_cb(cb: CallbackQuery, bot: Bot):
 @router.message(F.text, ~F.text.startswith("/"))
 async def on_text(m: Message, bot: Bot):
     uid = m.from_user.id
-    if uid in adm_guest and uid in ADMIN_IDS:
-        n = adm_guest[uid]
-        err = add_guest_to_slot(n, m.text)
+    if uid in adm_add and uid in ADMIN_IDS:
+        slot = adm_add[uid]
+        name, err = validate_name(m.text)
         if err:
-            await m.answer("⚠️ " + err + "\nПопробуй другое имя или нажми «Отмена».")
+            await m.answer("⚠️ " + err)
             return
-        adm_guest.pop(uid, None)
+        adm_add.pop(uid, None)
+        gid = add_guest(name)
+        if slot and slot_exists(slot):
+            with db:
+                db.execute("UPDATE slots SET owner=? WHERE n=?", (gid, slot))
+            await m.answer(f"✅ {name} добавлен(а) и поставлен(а) на место {slot}.")
+        else:
+            await m.answer(f"✅ {name} добавлен(а) в список людей.")
         dirty.set()
-        text, markup = panel_slot(n)
-        await m.answer("✅ Имя вписано.\n\n" + text, reply_markup=markup)
+        text, markup = panel_person(gid)
+        await m.answer(text, reply_markup=markup)
         return
     if uid in adm_rename and uid in ADMIN_IDS:
         target = adm_rename.pop(uid)
@@ -1460,6 +1748,9 @@ async def on_cb(cb: CallbackQuery, bot: Bot):
         elif res == "closed":
             views[uid] = {"mode": "main"}
             note, alert = "🔒 Запись закрыта. " + window_state()[2], True
+        elif res == "gap":
+            c = gap_conflict(uid, n)
+            note, alert = f"Слишком близко к твоему месту {c}: между своими местами должно быть минимум {gap_for(n)}.", True
         elif res == "taken":
             note, alert = "😔 Это место только что заняли.", True
         else:
@@ -1482,7 +1773,7 @@ async def on_cb(cb: CallbackQuery, bot: Bot):
     elif action == "trd":
         mine = own_slots(uid)
         others = db.execute(
-            "SELECT 1 FROM slots WHERE owner > 0 AND owner != ? LIMIT 1", (uid,)
+            "SELECT 1 FROM slots WHERE owner IS NOT NULL AND owner != ? LIMIT 1", (uid,)
         ).fetchone()
         if not mine:
             note, alert = "Сначала займи место — потом можно меняться.", True
@@ -1533,7 +1824,8 @@ async def main():
         BotCommand(command="start", description="Открыть очередь"),
         BotCommand(command="queue", description="Показать очередь заново"),
     ])
-    tasks = [asyncio.create_task(refresher(bot)), asyncio.create_task(window_watcher())]
+    tasks = [asyncio.create_task(refresher(bot)), asyncio.create_task(window_watcher()),
+             asyncio.create_task(autoclear_watcher())]
     try:
         await dp.start_polling(bot)
     finally:
